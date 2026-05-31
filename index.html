@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Human Time Control v2</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/addons/p5.sound.min.js"></script>
+    <style>
+        @import url('https://fonts.cdnfonts.com/css/futura-pt');
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #ffffff;
+            overflow: hidden;
+            font-family: 'Futura PT', 'Futura', sans-serif;
+            -webkit-tap-highlight-color: transparent;
+        }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+
+<script>
+let appState = "START"; // START, ANIMATING, PLAYING
+let controlMode = "TAP"; // TAP, PULSE, BLINK, WIND, SHAKE
+let capture;
+let song;
+let amplitude;
+
+// משתני עיצוב קבועים
+let strokeW = 8;
+let mainColor;
+let liveColor;
+
+// משתני קצב וזמן
+let currentBPM = 80;
+let targetBPM = 80;
+let tapTimes = [];
+let blinkTimes = [];
+let rValues = [];
+let lastCheckTime = 0;
+let windSpeed = 15; // ברירת מחדל לפני קבלת מיקום
+
+// משתני אנימציית מעבר (Morphing)
+let morphProgress = 0;
+let circleRadius = 80;
+
+// פידבקים חזותיים
+let volHistory = new Array(120).fill(0);
+let pulseProgress = 0;
+let isEyeClosed = false;
+let eyeCloseTimer = 0;
+
+function preload() {
+    soundFormats('mp3');
+    song = loadSound('song.mp3', 
+        () => console.log("Song loaded"), 
+        () => console.log("Using backup synth")
+    );
+}
+
+function setup() {
+    createCanvas(windowWidth, windowHeight);
+    amplitude = new p5.Amplitude(0.85);
+    mainColor = color(180, 40, 30);      // אדום בורדו עמוק
+    liveColor = color(245, 215, 66);     // צהוב ניאון ללייב של הדציבלים
+    
+    // בקשת מיקום בשביל מהירות הרוח במצב WIND
+    if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(position => {
+            let lat = position.coords.latitude;
+            let lon = position.coords.longitude;
+            fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current_weather=true`)
+                .then(res => res.json())
+                .then(data => {
+                    if(data.current_weather) windSpeed = data.current_weather.windspeed;
+                }).catch(e => console.log(e));
+        });
+    }
+}
+
+function draw() {
+    background(255);
+
+    // החלקת שינויי קצב במוזיקה
+    currentBPM = lerp(currentBPM, targetBPM, 0.04);
+    if (song && song.isLoaded() && song.isPlaying()) {
+        let rate = map(currentBPM, 40, 180, 0.5, 2.0, true);
+        song.rate(rate);
+    }
+
+    if (appState === "START") {
+        drawStartScreen();
+    } else if (appState === "ANIMATING") {
+        runMorphAnimation();
+    } else if (appState === "PLAYING") {
+        runHardwareAnalysis();
+        drawPlayerScreen();
+    }
+}
+
+// === 1. מסך פתיחה ===
+function drawStartScreen() {
+    textAlign(CENTER, CENTER);
+    noStroke();
+    fill(mainColor);
+    textSize(16);
+    textFont('Futura PT');
+    text("TAP TO START EXPERIENCE", width / 2, height / 3);
+
+    noFill();
+    stroke(mainColor);
+    strokeWeight(strokeW);
+    ellipse(width / 2, height / 2, circleRadius, circleRadius);
+}
+
+// === 2. אנימציית מעבר חלקה (העיגול נפתח לקו) ===
+function runMorphAnimation() {
+    morphProgress += 0.04;
+    stroke(mainColor);
+    strokeWeight(strokeW);
+    noFill();
+
+    if (morphProgress < 0.5) {
+        // שלב א: העיגול גדל ונפתח
+        let currentSize = map(morphProgress, 0, 0.5, circleRadius, width * 0.8);
+        ellipse(width / 2, height / 2, currentSize, currentSize * map(morphProgress, 0, 0.5, 1, 0.1));
+    } else {
+        // שלב ב: הופך לקו ישר שנמתח מקצה לקצה
+        let lineY = height / 2;
+        let xExtend = map(morphProgress, 0.5, 1.0, width * 0.1, 0);
+        line(xExtend, lineY, width - xExtend, lineY);
+    }
+
+    if (morphProgress >= 1.0) {
+        appState = "PLAYING";
+        if (song && song.isLoaded()) song.loop();
+    }
+}
+
+// === 3. מסך הנגן הראשי והאינטראקציות ===
+function drawPlayerScreen() {
+    let timelineY = height / 2;
+
+    // קו הטיימליין המרכזי (עובי 8)
+    stroke(mainColor);
+    strokeWeight(strokeW);
+    line(0, timelineY, width, timelineY);
+
+    // נקודת התקדמות השיר על הטיימליין
+    let durationSec = song && song.isLoaded() ? song.duration() : 180;
+    let currentSec = song && song.isPlaying() ? song.currentTime() : (millis() / 1000) % durationSec;
+    let progressX = map(currentSec, 0, durationSec, 0, width);
+    fill(mainColor);
+    noStroke();
+    ellipse(progressX, timelineY, 16, 16);
+
+    // גרף דציבלים עם פייד צבעוני (צהוב בלייב משמאל -> אדום בורדו)
+    drawLinearMonitor(timelineY);
+
+    // כותרת קצב נוכחית
+    textAlign(CENTER);
+    fill(0, 120);
+    textSize(14);
+    text("CURRENT RATE (BPM)", width / 2, 60);
+    fill(0);
+    textSize(42);
+    text(Math.round(currentBPM), width / 2, 105);
+
+    // ציור המצבים המיוחדים במרכז המסך (לפי המצב הנבחר)
+    drawActiveModeVisuals();
+
+    // תפריט תחתון
+    drawBottomMenu();
+}
+
+// גרף דציבלים מרוסן עם כניסה זוהרת משמאל
+function drawLinearMonitor(baselineY) {
+    let level = amplitude.getLevel();
+    let targetY = map(level, 0, 0.3, 0, 90, true);
+    volHistory.push(targetY);
+    if (volHistory.length > width / 4) volHistory.shift();
+
+    noFill();
+    push();
+    translate(0, baselineY);
+    
+    // ציור מקטעים כדי לייצר אפקט פייד מהצהוב הלייב משמאל לאדום
+    for (let i = 1; i < volHistory.length; i++) {
+        let x1 = map(i - 1, 0, volHistory.length - 1, 0, width);
+        let y1 = -volHistory[i - 1];
+        let x2 = map(i, 0, volHistory.length - 1, 0, width);
+        let y2 = -volHistory[i];
+        
+        // החלק השמאלי ביותר (הלייב) מקבל צהוב, השאר הופך בהדרגה לאדום בורדו
+        let amt = map(i, 0, volHistory.length * 0.25, 0, 1, true);
+        let segmentColor = lerpColor(liveColor, mainColor, amt);
+        
+        stroke(segmentColor);
+        strokeWeight(4); // עובי מעט עדין יותר לגרף כדי שלא יבלע את קו ה-8
+        line(x1, y1, x2, y2);
+    }
+    pop();
+}
+
+// ציור האנימציות המרכזיות לכל מצב (עובי 8)
+function drawActiveModeVisuals() {
+    let centerX = width / 2;
+    let centerY = height / 4 + 20;
+    
+    stroke(mainColor);
+    strokeWeight(strokeW);
+    noFill();
+
+    if (controlMode === "PULSE") {
+        // ציור לב גרפי באאוטליין 8
+        drawHeartShape(centerX, centerY, 60);
+        
+        // מסכת מדידה (לב מתמלא) שמראה פידבק התקדמות
+        pulseProgress = (pulseProgress + 0.005) % 1.0;
+        push();
+        stroke(liveColor);
+        // ציור קו מילוי שמקיף את הלב לפי התקדמות
+        let endAngle = map(pulseProgress, 0, 1, 0, TWO_PI);
+        noFill();
+        ellipse(centerX, centerY, 90, 90); 
+        pop();
+    } 
+    else if (controlMode === "BLINK") {
+        // פידבק עין גרפית נסגרת ונפתחת (עובי 8)
+        if (isEyeClosed && millis() - eyeCloseTimer > 200) isEyeClosed = false;
+        
+        if (isEyeClosed) {
+            // עין עצומה (קו ישר/קשת הפוכה)
+            arc(centerX, centerY, 80, 40, 0, PI);
+        } else {
+            // עין פתוחה
+            arc(centerX, centerY, 80, 45, 0, PI, OPEN);
+            arc(centerX, centerY, 80, 45, PI, TWO_PI, OPEN);
+            // אישון זז קצת עם הזמן
+            fill(mainColor);
+            ellipse(centerX + sin(frameCount*0.05)*10, centerY, 20, 20);
+        }
+    }
+}
+
+function drawHeartShape(x, y, size) {
+    push();
+    translate(x, y - 5);
+    beginShape();
+    for (let a = 0; a < TWO_PI; a += 0.05) {
+        let hx = 16 * pow(sin(a), 3);
+        let hy = -(13 * cos(a) - 5 * cos(2*a) - 2 * cos(3*a) - cos(4*a));
+        vertex(hx * (size/16), hy * (size/16));
+    }
+    endShape(CLOSE);
+    pop();
+}
+
+// תפריט תחתון מעוצב עם 5 מצבים
+function drawBottomMenu() {
+    let y = height - 60;
+    let modes = ["TAP", "PULSE", "BLINK", "WIND", "SHAKE"];
+    let spacing = width / (modes.length + 1);
+    
+    textAlign(CENTER, CENTER);
+    textSize(12);
+    noStroke();
+    
+    for (let i = 0; i < modes.length; i++) {
+        fill(controlMode === modes[i] ? mainColor : color(180));
+        text(modes[i], spacing * (i + 1), y);
+    }
+}
+
+// === 4. ניתוח חיישנים וחומרה בזמן אמת ===
+function runHardwareAnalysis() {
+    if (controlMode === "WIND") {
+        // מצב רוח: קצב קבוע מבוסס על ה-API
+        targetBPM = map(windSpeed, 0, 50, 60, 160, true);
+    } 
+    else if (controlMode === "SHAKE") {
+        // מצב ניעור: מבוסס על חיישני התנועה של המק/נייד
+        let shake = abs(accelerationX - pAccelerationX) + abs(accelerationY - pAccelerationY);
+        if (shake > 15) {
+            targetBPM = min(targetBPM + shake * 0.5, 180);
+        } else {
+            targetBPM = max(targetBPM - 0.3, 75); // דעיכה איטית כשמפסיקים לנענע
+        }
+    }
+    else if (capture && capture.width > 0) {
+        capture.loadPixels();
+        if (!capture.pixels || capture.pixels.length === 0) return;
+
+        let totalVal = 0;
+        let count = 0;
+
+        if (controlMode === "PULSE") {
+            for (let i = 0; i < capture.pixels.length; i += 16) {
+                totalVal += capture.pixels[i]; // ערוץ אדום
+                count++;
+            }
+            let avgRed = totalVal / count;
+            rValues.push(avgRed);
+            if (rValues.length > 60) rValues.shift();
+
+            if (rValues.length > 10) {
+                let localAvg = rValues.reduce((a, b) => a + b, 0) / rValues.length;
+                if (rValues[rValues.length - 1] > localAvg && rValues[rValues.length - 2] <= localAvg) {
+                    let now = millis();
+                    if (now - lastCheckTime > 450 && now - lastCheckTime < 1200) {
+                        targetBPM = 60000 / (now - lastCheckTime);
+                    }
+                    lastCheckTime = now;
+                }
+            }
+        } 
+        else if (controlMode === "BLINK") {
+            // אלגוריתם מצמוץ משופר: מעקב אחר שינוי תאורה מהיר במצלמה הקדמית
+            for (let i = 0; i < capture.pixels.length; i += 16) {
+                totalVal += (capture.pixels[i] + capture.pixels[i+1] + capture.pixels[i+2]) / 3;
+                count++;
+            }
+            let currentBright = totalVal / count;
+            rValues.push(currentBright);
+            if (rValues.length > 15) rValues.shift();
+
+            if (rValues.length > 5) {
+                let localAvg = rValues.reduce((a, b) => a + b, 0) / rValues.length;
+                // זיהוי נפילת בהירות חדה (כשהעפעף נסגר)
+                if (currentBright < localAvg * 0.88 && !isEyeClosed) {
+                    isEyeClosed = true;
+                    eyeCloseTimer = millis();
+                    blinkTimes.push(millis());
+                }
+            }
+            
+            let now = millis();
+            blinkTimes = blinkTimes.filter(t => now - t < 10000); // 10 שניות אחרונות
+            if (blinkTimes.length >= 1) {
+                targetBPM = map(blinkTimes.length * 6, 6, 45, 60, 150, true);
+            }
+        }
+    }
+}
+
+// === 5. ניהול לחיצות מסך ומגע ===
+function mousePressed() {
+    if (appState === "START") {
+        userStartAudio();
+        appState = "ANIMATING"; // מפעיל את האנימציה של העיגול שנפתח לקו
+        return false;
+    }
+
+    // ניווט בתפריט התחתון לפי מיקום
+    if (mouseY > height - 90) {
+        let modes = ["TAP", "PULSE", "BLINK", "WIND", "SHAKE"];
+        let spacing = width / (modes.length + 1);
+        let clickedIndex = Math.round(mouseX / spacing) - 1;
+        
+        if (clickedIndex >= 0 && clickedIndex < modes.length) {
+            if (capture) { capture.stop(); capture = null; } // כיבוי חומרה קודמת
+            controlMode = modes[clickedIndex];
+            
+            if (controlMode === "PULSE") initCamera("environment");
+            if (controlMode === "BLINK") initCamera("user");
+        }
+        return false;
+    }
+
+    // לוגיקת מצב TAP ידני
+    if (controlMode === "TAP") {
+        let now = millis();
+        tapTimes.push(now);
+        if (tapTimes.length > 5) tapTimes.shift();
+
+        if (tapTimes.length >= 2) {
+            let totalDiff = 0;
+            for (let i = 1; i < tapTimes.length; i++) {
+                totalDiff += (tapTimes[i] - tapTimes[i-1]);
+            }
+            targetBPM = 60000 / (totalDiff / (tapTimes.length - 1));
+        }
+    }
+    return false;
+}
+
+function initCamera(mode) {
+    let constraints = { video: { facingMode: mode, width: 80, height: 60 }, audio: false };
+    capture = createCapture(constraints);
+    capture.hide();
+}
+
+function windowResized() {
+    resizeCanvas(windowWidth, windowHeight);
+}
+</script>
+
+</body>
+</html>
